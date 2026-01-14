@@ -1,0 +1,140 @@
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+
+object CustomerDataPreprocess {
+
+  def main(args: Array[String]): Unit = {
+
+    val spark = SparkSession.builder()
+      .appName("Customer RFM Preprocess")
+      .getOrCreate()
+
+    import spark.implicits._
+
+    // =============================
+    // 1. 读取 CSV（HDFS）
+    // =============================
+    val rawDF = spark.read
+      .option("header", "true")
+      .option("inferSchema", "false")
+      .csv("hdfs:///user/hive/warehouse/ods.db/RFM聚类分析.csv")
+
+    // =============================
+    // 2. 类型转换 + 选字段
+    // =============================
+    val baseDF = rawDF.select(
+      col("user_id"),
+      col("gender").cast("int"),
+      col("age").cast("int"),
+      col("pay_times").cast("double"),
+      col("pay_num").cast("double"),
+      col("last_pay_time")
+    )
+
+    // =============================
+    // 3. 异常值 / 缺失值处理
+    // =============================
+  // 性别众数（排除 gender = 0）
+    val genderMode = baseDF
+      .filter(col("gender") =!= 0)
+      .groupBy("gender")
+      .count()
+      .orderBy(desc("count"))
+      .limit(1)
+      .select("gender")
+      .as[Int]
+      .head()
+
+    // 年龄均值（排除 age = 0，四舍五入）
+    val ageMean = baseDF
+      .filter(col("age") =!= 0)
+      .agg(round(avg("age"), 0).alias("age_mean"))
+      .collect()(0)
+      .getDouble(0)
+      .toInt
+
+    val cleanDF = baseDF
+      // 删除 gender=0 且 age=0 的记录
+      .filter(!(col("gender") === 0 && col("age") === 0))
+      // 单一字段为 0 的情况填充
+      .withColumn(
+        "gender",
+        when(col("gender") === 0, genderMode).otherwise(col("gender"))
+      )
+      .withColumn(
+        "age",
+        when(col("age") === 0, ageMean).otherwise(col("age"))
+      )
+      // 删除 pay_times 或 pay_num 为 0 的记录
+      .filter(col("pay_times") > 0 && col("pay_num") > 0)
+
+    // =============================
+    // 4. user_id 去重
+    // =============================
+    val dedupDF = cleanDF.dropDuplicates("user_id")
+
+    // =============================
+    // 5. 时间解析
+    // =============================
+    val timeDF = dedupDF.withColumn(
+      "last_pay_ts",
+      to_timestamp(col("last_pay_time"), "yyyy/M/d")
+    ).filter(col("last_pay_ts").isNotNull)
+
+    // =============================
+    // 6. 固定业务日期
+    // =============================
+    val extractDate = to_timestamp(lit("2016-07-20"), "yyyy-MM-dd")
+    val startDate   = to_timestamp(lit("2016-06-01"), "yyyy-MM-dd")
+
+    // =============================
+    // 7. R 计算
+    // =============================
+    val rDF = timeDF.withColumn(
+      "R",
+      datediff(extractDate, col("last_pay_ts"))
+    )
+
+    // =============================
+    // 8. 消费周期（月）
+    // =============================
+    val periodDF = rDF
+      .withColumn(
+        "period_days",
+        datediff(col("last_pay_ts"), startDate)
+      )
+      .withColumn(
+        "period_month",
+        when(col("period_days") <= 0, 1)
+          .otherwise(ceil(col("period_days") / 30))
+      )
+
+    // =============================
+    // 9. F / M 计算
+    // =============================
+    val rfmDF = periodDF
+      .withColumn("F", col("pay_times") / col("period_month"))
+      .withColumn("M", col("pay_num") / col("period_month"))
+      .select(
+        col("user_id"),
+        col("pay_num"),
+        col("pay_times"),
+        col("last_pay_time"),
+        col("R"),
+        round(col("F"), 2).alias("F"),
+        round(col("M"), 2).alias("M")
+      )
+
+    // =============================
+    // 10. 写回 HDFS
+    // =============================
+    rfmDF
+      .coalesce(1)
+      .write
+      .mode("overwrite")
+      .option("header", "true")
+      .csv("hdfs:///user/hive/warehouse/ods.db/customer_rfm_preprocess111")
+
+    spark.stop()
+  }
+}
